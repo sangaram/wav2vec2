@@ -64,10 +64,10 @@ class FeatureEncoder(nn.Module):
         
         
     def forward(self, x):
-        # x is a raw audio waveform of shape (B, T)
-        # reshaping it to (B, 1, T)
-        B, T = x.shape
-        x = x.unsqueeze(1)
+        if len(x.shape) == 2:
+            x = x.unsqueeze(1)
+        
+        B, _, T = x.shape
         for conv_block in self.conv_blocks:
             x = conv_block(x)
         

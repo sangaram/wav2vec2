@@ -1,5 +1,6 @@
 .DS_Store
 */.DS_Store
+wav2vec2.ipynb
 */.ipynb_checkpoints
 __pycache__
 */__pycache__
