@@ -17,10 +17,10 @@ def resize_audio(audio, max_size):
         return audio[:, :max_size]
     else:
         # padding with silence
-        start_pad_len = torch.randint(0, diff)
+        start_pad_len = torch.randint(0, diff, (1,)).item()
         end_pad_len = diff - start_pad_len
         n_channels = audio.size(0)
         start_pad = torch.zeros((n_channels, start_pad_len), dtype=audio.dtype)
         end_pad = torch.zeros((n_channels, end_pad_len), dtype=audio.dtype)
-        result = torch.cart((start_pad, audio, end_pad), dim=1)
+        result = torch.cat((start_pad, audio, end_pad), dim=1)
         return result
