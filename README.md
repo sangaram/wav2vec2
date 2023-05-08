@@ -55,7 +55,7 @@ python3 train.py \
 > `config`: the configuration file containing the parameters information of the model to pre-train. It is a path to **JSON** file. See [base.json](./wav2vec2/configs/base.json) for an example.\
 > `device`: either "cpu" or "gpu"\
 > `data`: the root directory containing a folder named `LibriSpeech` containing the `LibriSpeech` dataset used to pre-train the model in the [original paper](https://arxiv.org/pdf/2006.11477.pdf). If the given path doesn't exist, the `LibriSpeech` dataset is downloaded in the current directory by default.\
-> `batch_siz`: the batch size.\
+> `batch_size`: the batch size.\
 > `epochs`: the number of pre-training epoch.\
 > `save_path`: file path to save the model checkpoints.\
 > `save_every`: the saving frequency.\
