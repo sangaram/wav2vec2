@@ -1,0 +1,21 @@
+{
+    "fe_dim": 512,
+    "fe_kernel_sizes": [10,3,3,3,3,2,2],
+    "fe_strides": [5,2,2,2,2,2,2],
+    "p": 0.065,
+    "with_mask": "True",
+    "mask_span": 10,
+    "drop_prob": 0.05,
+    "rpe_kernel_size": 128,
+    "rpe_groups": 16,
+    "quantize": "True",
+    "qt_n_groups": 2,
+    "qt_n_entries": 320,
+    "final_dim": 768,
+    "temperature": 0.5,
+    "tfe_dff": 3072,
+    "tfe_num_heads": 8,
+    "tfe_num_layers": 12,
+    "tfe_activation": "relu",
+    "activation": "gelu"
+}

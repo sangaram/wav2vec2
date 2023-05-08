@@ -6,11 +6,12 @@ from tqdm.auto import tqdm
 from torch import nn, optim
 from torch.nn.modules.loss import _Loss
 from torch.utils.data import Dataset, DataLoader
-import torch.multiprocessing as mp
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 import os
+import argparse
+import json
 
 
 
@@ -35,15 +36,17 @@ class LRScheduler:
         
         self.epoch += 1
 
-def ddp_setup():
-    init_process_group(backend="gloo")
+def ddp_setup(backend):
+    init_process_group(backend=backend)
 
 class DistributedPreTrainer:
     def __init__(
         self,
         model: torch.nn.Module,
         train_data: DataLoader,
+        max_epochs: int,
         optimizer: torch.optim.Optimizer,
+        scheduler: LRScheduler,
         loss_fn: _Loss,
         save_every: int,
         snapshot_path: str,
@@ -52,8 +55,10 @@ class DistributedPreTrainer:
         self.model = model.to(self.gpu_id)
         self.train_data = train_data
         self.optimizer = optimizer
+        self.scheduler = scheduler
         self.loss_fn = loss_fn
         self.save_every = save_every
+        self.max_epochs = max_epochs
         self.epochs_run = 0
         self.snapshot_path = snapshot_path
         if os.path.exists(snapshot_path):
@@ -63,7 +68,7 @@ class DistributedPreTrainer:
         self.model = DDP(self.model, device_ids=[self.gpu_id])
 
     def _load_snapshot(self, snapshot_path):
-        loc = f"cpu:{self.gpu_id}"
+        loc = f"gpu:{self.gpu_id}"
         snapshot = torch.load(snapshot_path, map_location=loc)
         self.model.load_state_dict(snapshot["MODEL_STATE"])
         self.epochs_run = snapshot["EPOCHS_RUN"]
@@ -71,7 +76,7 @@ class DistributedPreTrainer:
 
     def _run_batch(self, batch):
         self.optimizer.zero_grad()
-        output = self.model(batch)
+        output = self.model(batch.to(self.gpu_id))
         x = output['x']
         y = output['y']
         mask = output['mask']
@@ -82,13 +87,20 @@ class DistributedPreTrainer:
         loss = self.loss_fn(x, y, logits)
         loss.backward()
         self.optimizer.step()
+        return loss
 
     def _run_epoch(self, epoch):
         b_sz = len(next(iter(self.train_data))[0])
-        print(f"[GPU{self.gpu_id}] Epoch {epoch} | Batchsize: {b_sz} | Steps: {len(self.train_data)}")
         self.train_data.sampler.set_epoch(epoch)
+        loss = .0
         for batch in self.train_data:
-            self._run_batch(batch.to(self.gpu_id))
+            loss += self._run_batch(batch.to(self.gpu_id))
+        
+        loss /= len(self.train_data)
+        print(f"[GPU{self.gpu_id}] Epoch {epoch} | Batchsize: {b_sz} | Steps: {len(self.train_data)} | Loss: {loss}")
+
+        self.scheduler.step()
+        return loss
 
     def _save_snapshot(self, epoch):
         snapshot = {
@@ -98,74 +110,23 @@ class DistributedPreTrainer:
         torch.save(snapshot, self.snapshot_path)
         print(f"Epoch {epoch} | Training snapshot saved at {self.snapshot_path}")
 
-    def train(self, max_epochs: int):
-        for epoch in range(self.epochs_run, max_epochs):
-            self._run_epoch(epoch)
+    def train(self):
+        if os.path.exists(os.path.join(os.getcwd(), self.snapshot_path)):
+            print(f"Loading pre-existing snapshot at {os.path.join(os.getcwd(), self.snapshot_path)} ....")
+            snapshot = torch.load(os.path.join(os.getcwd(), self.snapshot_path))
+            self.model.load_state_dict(snapshot["MODEL_STATE"])
+        
+        losses = []
+        self.model.train()
+        for epoch in range(self.epochs_run, self.max_epochs):
+            loss = self._run_epoch(epoch)
             if self.gpu_id == 0 and epoch % self.save_every == 0:
+                losses.append(loss)
                 self._save_snapshot(epoch)
+        
+        self.model.train(False)
+        return losses   
 
-
-def load_train_objs():
-    dataset = LibriSpeechDatasetWrapper(
-        root="..",
-        max_sample_size=200
-    )
-    device = torch.device("mps")
-    model = Wav2Vec2Model(
-        fe_n_blocks=3,
-        fe_dim=16,
-        fe_kernel_sizes=[4, 4, 2],
-        fe_strides=[1, 1, 1],
-        p=0.063,
-        with_mask=True,
-        mask_span=4,
-        drop_prob=0.05,
-        rpe_kernel_size=4,
-        rpe_groups=4,
-        qt_n_groups=4,
-        qt_n_entries=16,
-        final_dim=16,
-        temperature=1.3,
-        tfe_dff=32,
-        tfe_num_heads=2,
-        tfe_num_layers=4,
-        tfe_activation='relu',
-        activation='gelu'
-    ).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    loss_fn = PretrainingLoss(alpha=0.1, temperature=1.3, n_distractors=5)
-    return dataset, model, optimizer, loss_fn
-
-
-def prepare_dataloader(dataset: Dataset, batch_size: int):
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        pin_memory=True,
-        shuffle=False,
-        sampler=DistributedSampler(dataset)
-    )
-
-
-def main(save_every: int, total_epochs: int, batch_size: int, snapshot_path: str = "snapshot.pt"):
-    ddp_setup()
-    dataset, model, optimizer, loss_fn = load_train_objs()
-    train_data = prepare_dataloader(dataset, batch_size)
-    trainer = DistributedPreTrainer(model, train_data, optimizer, loss_fn, save_every, snapshot_path)
-    trainer.train(total_epochs)
-    destroy_process_group()
-
-"""
-if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description='simple distributed training job')
-    parser.add_argument('total_epochs', type=int, help='Total epochs to train the model')
-    parser.add_argument('save_every', type=int, help='How often to save a snapshot')
-    parser.add_argument('--batch_size', default=32, type=int, help='Input batch size on each device (default: 32)')
-    args = parser.parse_args()
-    
-    main(args.save_every, args.total_epochs, args.batch_size)
-"""
 
 class PreTrainer:
     def __init__(
@@ -174,7 +135,7 @@ class PreTrainer:
         dataset:Dataset,
         batch_size:int,
         epochs:int,
-        loss:PretrainingLoss,
+        loss_fn:PretrainingLoss,
         optimizer:optim.Optimizer,
         scheduler,
         log_period:int,
@@ -188,10 +149,11 @@ class PreTrainer:
         self.batch_size = batch_size
         self.dataloader = DataLoader(
             dataset,
-            batch_size=batch_size
+            batch_size=batch_size,
+            shuffle=False
         )
         self.epochs = epochs
-        self.loss = loss
+        self.loss_fn = loss_fn
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.log_period = log_period
@@ -207,7 +169,7 @@ class PreTrainer:
         B, T, C = x.shape
         x = x[mask].view(B, -1, C)
         y = y[mask].view(B, -1, C)
-        loss = self.loss(x, y, logits)
+        loss = self.loss_fn(x, y, logits)
         return loss
     
     def _run_epoch(self):
@@ -242,60 +204,111 @@ class PreTrainer:
         self.model.train(False)
 
 if __name__ == "__main__":
-    device = torch.device("cpu")
-    model = Wav2Vec2Model(
-        fe_n_blocks=7,
-        fe_dim=512,
-        fe_kernel_sizes=[10,3,3,3,3,2,2],
-        fe_strides=[5,2,2,2,2,2,2],
-        p=0.065,
-        with_mask=True,
-        mask_span=10,
-        drop_prob=0.05,
-        rpe_kernel_size=128,
-        rpe_groups=16,
-        qt_n_groups=2,
-        qt_n_entries=320,
-        final_dim=768,
-        temperature=0.5,
-        tfe_dff=3072,
-        tfe_num_heads=8,
-        tfe_num_layers=12,
-        tfe_activation='relu',
-        activation='gelu'
-    )
+    parser = argparse.ArgumentParser(description="CLI arguments parser")
+    parser.add_argument("--distributed", type=int)
+    parser.add_argument("--config", type=str)
+    parser.add_argument("--device", type=str)
+    parser.add_argument("--data", type=str)
+    parser.add_argument("--max_sample_size", type=int)
+    parser.add_argument("--batch_size", type=int)
+    parser.add_argument("--epochs", type=int)
+    parser.add_argument("--save_path", type=str)
+    parser.add_argument("--save_every", type=int)
 
-    loss = PretrainingLoss(alpha=0.1, temperature=0.1, n_distractors=100)
+    args = parser.parse_args()
+    
+    try:
+        dataset = LibriSpeechDatasetWrapper(
+            root = args.data,
+            max_sample_size=args.max_sample_size if args.max_sample_size else 250_000
+        )
+    except:
+        print(f"LibriSpeech folder not found at {args.data}. Downloading LibriSpeech dataset into current directory ({os.getcwd()})")
+        dataset = LibriSpeechDatasetWrapper(
+            root = args.data,
+            max_sample_size=args.max_sample_size if args.max_sample_size else 250_000,
+            download=True
+        )
+    
+    device = args.device if args.device else "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Training the model on device: {device}")
+
+    config_path = args.config
+    if os.path.isfile(os.path.join(os.getcwd(), config_path)):
+        config = json.load(open(os.path.join(os.getcwd(), config_path)))
+    else:
+        print(f"The given configuration file path does not exist or is not a proper file, using the default config at {os.path.join(os.getcwd(), './configs/base.json')}")
+        config = json.load(open(os.path.join(os.getcwd(), './configs/base.json')))
+    
+    model = Wav2Vec2Model(
+        fe_dim=config["fe_dim"],
+        fe_kernel_sizes=config["fe_kernel_sizes"],
+        fe_strides=config["fe_strides"],
+        p=config["p"],
+        with_mask=bool(config["with_mask"]),
+        mask_span=config["mask_span"],
+        drop_prob=config["drop_prob"],
+        rpe_kernel_size=config["rpe_kernel_size"],
+        rpe_groups=config["rpe_groups"],
+        quantize=bool(config["quantize"]),
+        qt_n_groups=config["qt_n_groups"],
+        qt_n_entries=config["qt_n_entries"],
+        final_dim=config["final_dim"],
+        temperature=config["temperature"],
+        tfe_dff=config["tfe_dff"],
+        tfe_num_heads=config["tfe_num_heads"],
+        tfe_num_layers=config["tfe_num_layers"],
+        tfe_activation=config["tfe_activation"],
+        activation=config["activation"]
+    )
+    
+    loss_fn = PretrainingLoss(alpha=0.1, temperature=0.1, n_distractors=100)
 
     optimizer = optim.Adam(params=model.parameters())
 
-    epochs = 200
-
     scheduler = LRScheduler(
         optimizer=optimizer,
-        epochs=epochs,
+        epochs=args.epochs,
         max_lr=1e-5
     )
 
-    dataset = LibriSpeechDatasetWrapper(
-        root="../..",
-        max_sample_size=250_000
-    )
+    if args.distributed == 1:
+        backend = "gloo" if device == "cpu" else "nccl"
+        ddp_setup(backend)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            pin_memory=True,
+            shuffle=False,
+            sampler=DistributedSampler(dataset)
+        )
 
-    trainer = PreTrainer(
-        model=model,
-        dataset=dataset,
-        batch_size=16,
-        epochs=20,
-        loss=loss,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        log_period=5,
-        save_period=5,
-        save_path="checkpoint.pt",
-        device=device
-    )
-    
-    trainer.train()
-    
-
+        trainer = DistributedPreTrainer(
+            model=model,
+            train_data=dataloader,
+            max_epochs=args.epochs,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            loss_fn=loss_fn,
+            save_every=args.save_every,
+            snapshot_path=args.save_path,
+        )
+        trainer.train()
+        destroy_process_group()
+        
+    else:
+        trainer = PreTrainer(
+            model=model,
+            dataset=dataset,
+            batch_size=args.batch_size,
+            epochs=args.epochs,
+            loss_fn=loss_fn,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            log_period=5,
+            save_period=5,
+            save_path=args.save_path,
+            device=device
+        )
+        
+        trainer.train()
